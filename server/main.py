@@ -154,6 +154,28 @@ DEFAULT_CONFIG = {
 }
 
 
+# --- Monkey-patch: disable thinking mode for OpenAI-compatible LLMs (e.g. Qwen3.5) ---
+if os.environ.get("OPENAI_DISABLE_THINKING", "").lower() in ("1", "true"):
+    from mem0.llms.openai import OpenAILLM
+
+    _orig_generate = OpenAILLM.generate_response
+
+    def _patched_generate(self, messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
+        _orig_create = self.client.chat.completions.create
+
+        def _create_with_no_thinking(**kw):
+            kw.setdefault("extra_body", {})["enable_thinking"] = False
+            return _orig_create(**kw)
+
+        self.client.chat.completions.create = _create_with_no_thinking
+        try:
+            return _orig_generate(self, messages, response_format, tools, tool_choice, **kwargs)
+        finally:
+            self.client.chat.completions.create = _orig_create
+
+    OpenAILLM.generate_response = _patched_generate
+    logging.info("Patched OpenAILLM: thinking mode disabled")
+
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
 
 # --- Concurrency limiter (500 = DashScope QPS upper bound) ---
