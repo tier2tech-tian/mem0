@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +29,9 @@ COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "memories")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "bge-m3")
 EMBEDDING_DIMS = os.environ.get("EMBEDDING_DIMS", "1024")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5:7b")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # "ollama" or "openai"
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "history/history.db")
 
 # --- API Key Management ---
@@ -120,13 +125,23 @@ DEFAULT_CONFIG = {
         },
     },
     "llm": {
-        "provider": "ollama",
-        "config": {
-            "model": LLM_MODEL,
-            "temperature": 0,
-            "max_tokens": 2000,
-            "ollama_base_url": OLLAMA_BASE_URL,
-        },
+        "provider": LLM_PROVIDER,
+        "config": (
+            {
+                "model": LLM_MODEL,
+                "temperature": 0,
+                "max_tokens": 2000,
+                "api_key": LLM_API_KEY,
+                "openai_base_url": LLM_BASE_URL,
+            }
+            if LLM_PROVIDER == "openai"
+            else {
+                "model": LLM_MODEL,
+                "temperature": 0,
+                "max_tokens": 2000,
+                "ollama_base_url": OLLAMA_BASE_URL,
+            }
+        ),
     },
     "embedder": {
         "provider": "ollama",
@@ -140,6 +155,41 @@ DEFAULT_CONFIG = {
 
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
+
+# --- Concurrency limiter (500 = DashScope QPS upper bound) ---
+_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "500"))
+_ollama_semaphore = threading.Semaphore(_MAX_CONCURRENT)
+_queue_waiting = 0
+_queue_processing = 0  # now a counter, not bool
+_queue_lock = threading.Lock()
+
+
+def _call_with_semaphore(fn, max_retries=2):
+    global _queue_waiting, _queue_processing
+    with _queue_lock:
+        _queue_waiting += 1
+    try:
+        with _ollama_semaphore:
+            with _queue_lock:
+                _queue_waiting -= 1
+                _queue_processing += 1
+            try:
+                for attempt in range(max_retries):
+                    try:
+                        return fn()
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logging.warning("Retry %d: %s", attempt + 1, e)
+                            time.sleep(1)
+                        else:
+                            raise
+            finally:
+                with _queue_lock:
+                    _queue_processing -= 1
+    except:
+        with _queue_lock:
+            _queue_waiting = max(0, _queue_waiting - 1)
+        raise
 
 app = FastAPI(
     title="Mem0 REST APIs",
@@ -244,6 +294,7 @@ def create_api_key(body: CreateKeyRequest):
     keys[key_hash] = {
         "user_id": body.user_id,
         "label": body.label,
+        "raw_key": raw_key,
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
     _save_api_keys(keys)
@@ -261,6 +312,7 @@ def list_api_keys():
             "key_prefix": hash_val[:12],
             "user_id": entry.get("user_id"),
             "label": entry.get("label"),
+            "raw_key": entry.get("raw_key", ""),
             "created_at": entry.get("created_at"),
         })
     return {"keys": result}
@@ -279,6 +331,11 @@ def delete_api_key(key_prefix: str):
     _save_api_keys(keys)
     logging.info("Deleted API key with prefix %s", key_prefix)
     return {"message": "Key deleted", "key_prefix": key_prefix}
+
+
+@app.get("/admin/queue", summary="Queue status")
+def queue_status():
+    return {"waiting": _queue_waiting, "processing": _queue_processing, "max_concurrent": _MAX_CONCURRENT}
 
 
 @app.get("/admin/", summary="Admin dashboard", response_class=HTMLResponse, include_in_schema=False)
@@ -331,6 +388,9 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 .btn-primary:hover:not(:disabled){background:#c4684a}
 .btn-primary:active:not(:disabled){transform:scale(.97)}
 .btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-copy-key{background:#D97757;color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-copy-key:hover{background:#c4684a}
+.btn-copy-key.copied{background:#5a9a6a}
 .btn-danger{background:none;color:#999;padding:6px 10px;font-size:13px}
 .btn-danger:hover{color:#c44;background:#fef2f0;border-radius:6px}
 
@@ -377,12 +437,33 @@ tbody tr:hover{background:#faf9f7}
   font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;
 }
 .toast.show{opacity:1}
+
+/* Queue status */
+.queue-bar{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 16px;border-radius:10px;
+  background:#fff;border:1px solid #e8e6e3;
+  margin-bottom:20px;font-size:13px;color:#666;
+  box-shadow:0 1px 3px rgba(0,0,0,.04);
+}
+.queue-dot{
+  width:8px;height:8px;border-radius:50%;flex-shrink:0;
+}
+.queue-dot.idle{background:#5a9a6a}
+.queue-dot.busy{background:#d4882a;animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style>
 </head>
 <body>
 <div class="container">
   <h1>Mem0 API Keys</h1>
   <p class="subtitle">管理远程访问所需的 API Key</p>
+
+  <!-- Queue status -->
+  <div class="queue-bar" id="queue-bar">
+    <span class="queue-dot idle" id="queue-dot"></span>
+    <span id="queue-text">空闲</span>
+  </div>
 
   <!-- Create -->
   <div class="card">
@@ -435,14 +516,18 @@ async function loadKeys() {
       wrap.innerHTML = '<div class="empty">暂无 Key</div>';
       return;
     }
-    let html = '<table><thead><tr><th>Prefix</th><th>User</th><th>标签</th><th>创建时间</th><th></th></tr></thead><tbody>';
+    let html = '<table><thead><tr><th>Prefix</th><th>User</th><th>标签</th><th>创建时间</th><th></th><th></th></tr></thead><tbody>';
     for (const k of _cachedKeys) {
       const t = k.created_at ? new Date(k.created_at).toLocaleString('zh-CN', {dateStyle:'short',timeStyle:'short'}) : '-';
+      const copyBtn = k.raw_key
+        ? `<button class="btn btn-copy-key" onclick="copyKey(this,'${esc(k.raw_key)}')">复制 Key</button>`
+        : '<span style="color:#aaa;font-size:12px">旧 Key</span>';
       html += `<tr>
         <td class="mono">${esc(k.key_prefix)}</td>
         <td>${esc(k.user_id||'')}</td>
         <td>${esc(k.label||'-')}</td>
         <td style="color:#888">${t}</td>
+        <td>${copyBtn}</td>
         <td><button class="btn btn-danger" onclick="delKey('${esc(k.key_prefix)}')">删除</button></td>
       </tr>`;
     }
@@ -524,6 +609,15 @@ $('#btn-copy').addEventListener('click', () => {
   });
 });
 
+function copyKey(btn, key) {
+  navigator.clipboard.writeText(key).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '已复制';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+  });
+}
+
 async function delKey(prefix) {
   if (!confirm('确定删除 Key ' + prefix + '？')) return;
   try {
@@ -541,6 +635,29 @@ async function delKey(prefix) {
 }
 
 loadKeys();
+
+// Queue status polling
+async function pollQueue() {
+  try {
+    const res = await fetch('/admin/queue');
+    const data = await res.json();
+    const dot = $('#queue-dot');
+    const txt = $('#queue-text');
+    const active = data.processing || 0;
+    const waiting = data.waiting || 0;
+    if (active > 0 || waiting > 0) {
+      dot.className = 'queue-dot busy';
+      let s = active + ' 个处理中';
+      if (waiting > 0) s += '，' + waiting + ' 个排队';
+      txt.textContent = s;
+    } else {
+      dot.className = 'queue-dot idle';
+      txt.textContent = '空闲';
+    }
+  } catch(e) {}
+}
+pollQueue();
+setInterval(pollQueue, 2000);
 </script>
 </body>
 </html>
@@ -598,10 +715,12 @@ def add_memory(memory_create: MemoryCreate):
 
     params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
     try:
-        response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+        response = _call_with_semaphore(
+            lambda: MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+        )
         return JSONResponse(content=response)
     except Exception as e:
-        logging.exception("Error in add_memory:")  # This will log the full traceback
+        logging.exception("Error in add_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -646,7 +765,9 @@ def search_memories(search_req: SearchRequest):
     """Search for memories based on a query."""
     try:
         params = {k: v for k, v in search_req.model_dump().items() if v is not None and k != "query"}
-        return MEMORY_INSTANCE.search(query=search_req.query, **params)
+        return _call_with_semaphore(
+            lambda: MEMORY_INSTANCE.search(query=search_req.query, **params)
+        )
     except Exception as e:
         logging.exception("Error in search_memories:")
         raise HTTPException(status_code=500, detail=str(e))
