@@ -28,6 +28,9 @@ QDRANT_PORT = os.environ.get("QDRANT_PORT", "6333")
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "memories")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "bge-m3")
 EMBEDDING_DIMS = os.environ.get("EMBEDDING_DIMS", "1024")
+EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "ollama")  # "ollama" or "openai"
+EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5:7b")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # "ollama" or "openai"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -144,11 +147,20 @@ DEFAULT_CONFIG = {
         ),
     },
     "embedder": {
-        "provider": "ollama",
-        "config": {
-            "model": EMBEDDING_MODEL,
-            "ollama_base_url": OLLAMA_BASE_URL,
-        },
+        "provider": EMBEDDING_PROVIDER,
+        "config": (
+            {
+                "model": EMBEDDING_MODEL,
+                "embedding_dims": int(EMBEDDING_DIMS),
+                "api_key": EMBEDDING_API_KEY or LLM_API_KEY,
+                "openai_base_url": EMBEDDING_BASE_URL or LLM_BASE_URL,
+            }
+            if EMBEDDING_PROVIDER == "openai"
+            else {
+                "model": EMBEDDING_MODEL,
+                "ollama_base_url": OLLAMA_BASE_URL,
+            }
+        ),
     },
     "history_db_path": HISTORY_DB_PATH,
 }
