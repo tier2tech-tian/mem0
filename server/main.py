@@ -23,8 +23,9 @@ load_dotenv()
 
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = os.environ.get("QDRANT_PORT", "6333")
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "")
+QDRANT_PORT = os.environ.get("QDRANT_PORT", "")
+QDRANT_PATH = os.environ.get("QDRANT_PATH", "")  # local file-based Qdrant (no Docker needed)
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "memories")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "bge-m3")
 EMBEDDING_DIMS = os.environ.get("EMBEDDING_DIMS", "1024")
@@ -121,8 +122,8 @@ DEFAULT_CONFIG = {
     "vector_store": {
         "provider": "qdrant",
         "config": {
-            "host": QDRANT_HOST,
-            "port": int(QDRANT_PORT),
+            **( {"path": QDRANT_PATH, "on_disk": True} if QDRANT_PATH
+                else {"host": QDRANT_HOST, "port": int(QDRANT_PORT or 6333)} ),
             "collection_name": COLLECTION_NAME,
             "embedding_model_dims": int(EMBEDDING_DIMS),
         },
