@@ -37,6 +37,9 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # "ollama" or "openai"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "history/history.db")
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+_admin_session_token = secrets.token_urlsafe(32)  # regenerated on restart
 
 # --- API Key Management ---
 API_KEYS_FILE = Path(os.environ.get("API_KEYS_FILE", Path(__file__).parent / "api_keys.json"))
@@ -271,9 +274,19 @@ async def auth_middleware(request: Request, call_next) -> Response:
     if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
-    # 3. Admin endpoints are local-only (already blocked since we're here = remote)
+    # 3. Admin endpoints: require login session (cookie) or local access
     if request.url.path.startswith("/admin/"):
-        return JSONResponse(status_code=403, content={"detail": "Admin endpoints are local-only"})
+        # Allow login page and login POST without session
+        if request.url.path in ("/admin/login", "/admin/login/"):
+            return await call_next(request)
+        # Check session cookie
+        session = request.cookies.get("mem0_admin")
+        if session == _admin_session_token and ADMIN_PASS:
+            return await call_next(request)
+        # Not authenticated → redirect to login
+        if request.url.path.endswith(("/", "")):
+            return RedirectResponse(url="/admin/login")
+        return JSONResponse(status_code=401, content={"detail": "Admin login required"})
 
     # 4. Extract Bearer token
     auth_header = request.headers.get("authorization", "")
@@ -310,7 +323,134 @@ async def auth_middleware(request: Request, call_next) -> Response:
     return await call_next(request)
 
 
-# --- Admin Endpoints (local-only, enforced by middleware) ---
+# --- Admin Endpoints (session-authenticated, enforced by middleware) ---
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+ADMIN_LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mem0 Admin Login</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:#FAF9F7;color:#1a1a1a;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+}
+.login-card{
+  background:#fff;border:1px solid #e8e6e3;border-radius:12px;
+  padding:32px;width:340px;box-shadow:0 2px 8px rgba(0,0,0,.06);
+}
+.login-card h1{font-size:20px;font-weight:600;margin-bottom:4px;text-align:center}
+.login-card .subtitle{color:#666;font-size:13px;text-align:center;margin-bottom:24px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:500;color:#555;margin-bottom:4px}
+.field input{
+  width:100%;padding:9px 12px;border:1px solid #ddd;border-radius:8px;
+  font-size:14px;outline:none;transition:border .15s;background:#fafafa;
+}
+.field input:focus{border-color:#D97757;background:#fff}
+.btn-login{
+  width:100%;padding:10px;border:none;border-radius:8px;
+  font-size:14px;font-weight:500;cursor:pointer;
+  background:#D97757;color:#fff;transition:background .15s;
+}
+.btn-login:hover{background:#c4684a}
+.btn-login:disabled{opacity:.5;cursor:not-allowed}
+.error-msg{color:#c44;font-size:13px;text-align:center;margin-top:12px;display:none}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <h1>Mem0 Admin</h1>
+  <p class="subtitle">请登录以管理 API Keys</p>
+  <form id="login-form">
+    <div class="field">
+      <label>用户名</label>
+      <input id="inp-user" type="text" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input id="inp-pass" type="password" autocomplete="current-password">
+    </div>
+    <button class="btn-login" type="submit">登录</button>
+    <div class="error-msg" id="error-msg"></div>
+  </form>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector('.btn-login');
+  const err = document.getElementById('error-msg');
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  err.style.display = 'none';
+  try {
+    const res = await fetch('/admin/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('inp-user').value,
+        password: document.getElementById('inp-pass').value
+      })
+    });
+    if (res.ok) {
+      window.location.href = '/admin/';
+    } else {
+      const data = await res.json();
+      err.textContent = data.detail || '登录失败';
+      err.style.display = 'block';
+    }
+  } catch(ex) {
+    err.textContent = '请求失败';
+    err.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录';
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/login", response_class=HTMLResponse, include_in_schema=False)
+def admin_login_page():
+    return HTMLResponse(content=ADMIN_LOGIN_HTML)
+
+
+@app.post("/admin/login", include_in_schema=False)
+def admin_login(body: AdminLoginRequest):
+    if not ADMIN_PASS:
+        raise HTTPException(status_code=403, detail="Admin login not configured (set ADMIN_PASS)")
+    if body.username != ADMIN_USER or body.password != ADMIN_PASS:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    response = JSONResponse(content={"message": "OK"})
+    response.set_cookie(
+        key="mem0_admin",
+        value=_admin_session_token,
+        httponly=True,
+        max_age=86400 * 7,  # 7 days
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/admin/logout", include_in_schema=False)
+def admin_logout():
+    response = RedirectResponse(url="/admin/login")
+    response.delete_cookie("mem0_admin")
+    return response
+
 
 class CreateKeyRequest(BaseModel):
     user_id: str = Field(..., description="User ID to bind this key to")
@@ -373,6 +513,104 @@ def queue_status():
     return {"waiting": _queue_waiting, "processing": _queue_processing, "max_concurrent": _MAX_CONCURRENT}
 
 
+@app.get("/admin/users", summary="List all users with memory counts")
+def admin_list_users():
+    """Scroll through all Qdrant points and aggregate by user_id/agent_id."""
+    vs = MEMORY_INSTANCE.vector_store
+    user_stats: Dict[str, Dict[str, Any]] = {}  # key → {count, latest}
+    next_offset = None
+    while True:
+        points, next_offset = vs.client.scroll(
+            collection_name=vs.collection_name,
+            limit=1000,
+            offset=next_offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            uid = p.payload.get("user_id") or p.payload.get("agent_id") or "unknown"
+            kind = "user_id" if p.payload.get("user_id") else ("agent_id" if p.payload.get("agent_id") else "unknown")
+            key = f"{kind}:{uid}"
+            if key not in user_stats:
+                user_stats[key] = {"id_type": kind, "id_value": uid, "count": 0, "latest": ""}
+            user_stats[key]["count"] += 1
+            ts = p.payload.get("updated_at") or p.payload.get("created_at") or ""
+            if ts > user_stats[key]["latest"]:
+                user_stats[key]["latest"] = ts
+        if next_offset is None:
+            break
+    result = sorted(user_stats.values(), key=lambda x: x["count"], reverse=True)
+    return {"users": result, "total_memories": sum(u["count"] for u in result)}
+
+
+@app.get("/admin/memories/browse", summary="Browse memories by user/agent")
+def admin_browse_memories(
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List memories with pagination, optionally filtered by user_id or agent_id."""
+    vs = MEMORY_INSTANCE.vector_store
+    filters = {}
+    if user_id:
+        filters["user_id"] = user_id
+    if agent_id:
+        filters["agent_id"] = agent_id
+
+    query_filter = None
+    if filters:
+        from qdrant_client.models import FieldCondition, MatchValue, Filter as QFilter
+        conditions = [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in filters.items()]
+        query_filter = QFilter(must=conditions)
+
+    # Get total count
+    total = vs.client.count(collection_name=vs.collection_name, count_filter=query_filter).count
+
+    # Scroll with offset simulation (qdrant scroll doesn't support numeric offset well, so we fetch and skip)
+    all_points = []
+    next_off = None
+    needed = offset + limit
+    while len(all_points) < needed:
+        batch, next_off = vs.client.scroll(
+            collection_name=vs.collection_name,
+            scroll_filter=query_filter,
+            limit=min(1000, needed - len(all_points)),
+            offset=next_off,
+            with_payload=True,
+            with_vectors=False,
+        )
+        all_points.extend(batch)
+        if next_off is None:
+            break
+
+    page = all_points[offset:offset + limit]
+    memories = []
+    for p in page:
+        memories.append({
+            "id": str(p.id),
+            "memory": p.payload.get("data", ""),
+            "user_id": p.payload.get("user_id"),
+            "agent_id": p.payload.get("agent_id"),
+            "hash": p.payload.get("hash"),
+            "created_at": p.payload.get("created_at"),
+            "updated_at": p.payload.get("updated_at"),
+            "metadata": {k: v for k, v in p.payload.items()
+                         if k not in ("data", "user_id", "agent_id", "run_id", "hash", "created_at", "updated_at")},
+        })
+    return {"memories": memories, "total": total, "offset": offset, "limit": limit}
+
+
+@app.delete("/admin/memories/{memory_id}", summary="Delete memory (admin)")
+def admin_delete_memory(memory_id: str):
+    """Delete a memory via admin dashboard."""
+    try:
+        MEMORY_INSTANCE.delete(memory_id=memory_id)
+        return {"message": "Memory deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/", summary="Admin dashboard", response_class=HTMLResponse, include_in_schema=False)
 def admin_page():
     return HTMLResponse(content=ADMIN_HTML)
@@ -384,7 +622,7 @@ ADMIN_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mem0 API Keys</title>
+<title>Mem0 Admin</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -392,7 +630,7 @@ body{
   background:#FAF9F7;color:#1a1a1a;line-height:1.6;
   min-height:100vh;padding:48px 16px;
 }
-.container{max-width:640px;margin:0 auto}
+.container{max-width:800px;margin:0 auto}
 h1{font-size:22px;font-weight:600;margin-bottom:4px}
 .subtitle{color:#666;font-size:14px;margin-bottom:32px}
 
@@ -487,12 +725,36 @@ tbody tr:hover{background:#faf9f7}
 .queue-dot.idle{background:#5a9a6a}
 .queue-dot.busy{background:#d4882a;animation:pulse 1.2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* Memory items */
+.mem-item{
+  padding:12px 14px;border-bottom:1px solid #f0efed;
+  font-size:13px;animation:fadeIn .2s;
+}
+.mem-item:last-child{border-bottom:none}
+.mem-item:hover{background:#faf9f7}
+.mem-content{margin-bottom:4px;line-height:1.5}
+.mem-meta{color:#999;font-size:11px;display:flex;gap:12px;flex-wrap:wrap}
+.mem-meta span{white-space:nowrap}
+.badge{
+  display:inline-block;padding:1px 6px;border-radius:4px;
+  font-size:11px;font-weight:500;cursor:pointer;
+}
+.badge-user{background:#E8F0FE;color:#1967D2}
+.badge-agent{background:#FEF3E0;color:#E37400}
+.btn-del-mem{
+  background:none;border:none;color:#ccc;cursor:pointer;font-size:12px;
+  padding:2px 6px;border-radius:4px;transition:all .15s;
+}
+.btn-del-mem:hover{color:#c44;background:#fef2f0}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Mem0 API Keys</h1>
-  <p class="subtitle">管理远程访问所需的 API Key</p>
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div><h1>Mem0 Admin</h1><p class="subtitle">管理 API Keys、用户与记忆</p></div>
+    <a href="/admin/logout" style="color:#999;font-size:13px;text-decoration:none">退出登录</a>
+  </div>
 
   <!-- Queue status -->
   <div class="queue-bar" id="queue-bar">
@@ -521,6 +783,30 @@ tbody tr:hover{background:#faf9f7}
   <div class="card">
     <h2>已有 Keys</h2>
     <div class="table-wrap" id="key-list"></div>
+  </div>
+
+  <!-- Users -->
+  <div class="card">
+    <h2>用户概览 <span id="total-memories" style="font-weight:400;color:#888;font-size:13px"></span></h2>
+    <div class="table-wrap" id="user-list"><div class="empty">加载中…</div></div>
+  </div>
+
+  <!-- Memory browser -->
+  <div class="card">
+    <h2>记忆浏览</h2>
+    <div class="form-row" style="margin-bottom:14px">
+      <input id="inp-browse-uid" type="text" placeholder="user_id（可选）">
+      <input id="inp-browse-aid" type="text" placeholder="agent_id（可选）">
+      <button class="btn btn-primary" id="btn-browse">查询</button>
+    </div>
+    <div id="mem-pager" style="display:none;margin-bottom:10px;font-size:13px;color:#888;display:flex;justify-content:space-between;align-items:center">
+      <span id="mem-info"></span>
+      <span>
+        <button class="btn" id="btn-prev" style="padding:4px 10px;font-size:12px" disabled>上一页</button>
+        <button class="btn" id="btn-next" style="padding:4px 10px;font-size:12px" disabled>下一页</button>
+      </span>
+    </div>
+    <div class="table-wrap" id="mem-list"><div class="empty">输入条件后点击查询</div></div>
   </div>
 </div>
 
@@ -693,6 +979,131 @@ async function pollQueue() {
 }
 pollQueue();
 setInterval(pollQueue, 2000);
+
+// ===== Users module =====
+async function loadUsers() {
+  const wrap = $('#user-list');
+  try {
+    const res = await fetch('/admin/users');
+    const data = await res.json();
+    $('#total-memories').textContent = '共 ' + data.total_memories + ' 条记忆';
+    const users = data.users || [];
+    if (users.length === 0) {
+      wrap.innerHTML = '<div class="empty">暂无用户</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>类型</th><th>ID</th><th>记忆数</th><th>最近更新</th><th></th></tr></thead><tbody>';
+    for (const u of users) {
+      const t = u.latest ? new Date(u.latest).toLocaleString('zh-CN', {dateStyle:'short',timeStyle:'short'}) : '-';
+      const badge = u.id_type === 'user_id' ? 'badge-user' : 'badge-agent';
+      html += '<tr>' +
+        '<td><span class="badge ' + badge + '">' + esc(u.id_type) + '</span></td>' +
+        '<td>' + esc(u.id_value) + '</td>' +
+        '<td style="font-weight:600">' + u.count + '</td>' +
+        '<td style="color:#888">' + t + '</td>' +
+        '<td><button class="btn" style="padding:4px 10px;font-size:12px" ' +
+          'onclick="browseUser(\'' + esc(u.id_type) + '\',\'' + esc(u.id_value) + '\')">查看</button></td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  } catch(e) {
+    wrap.innerHTML = '<div class="empty">加载失败</div>';
+  }
+}
+loadUsers();
+
+function browseUser(idType, idValue) {
+  if (idType === 'user_id') {
+    $('#inp-browse-uid').value = idValue;
+    $('#inp-browse-aid').value = '';
+  } else {
+    $('#inp-browse-aid').value = idValue;
+    $('#inp-browse-uid').value = '';
+  }
+  _memOffset = 0;
+  loadMemories();
+  // Scroll to memory browser
+  $('#mem-list').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+// ===== Memory browser module =====
+let _memOffset = 0;
+const _memLimit = 20;
+
+$('#btn-browse').addEventListener('click', () => {
+  _memOffset = 0;
+  loadMemories();
+});
+
+$('#btn-prev').addEventListener('click', () => {
+  _memOffset = Math.max(0, _memOffset - _memLimit);
+  loadMemories();
+});
+
+$('#btn-next').addEventListener('click', () => {
+  _memOffset += _memLimit;
+  loadMemories();
+});
+
+async function loadMemories() {
+  const wrap = $('#mem-list');
+  const uid = $('#inp-browse-uid').value.trim();
+  const aid = $('#inp-browse-aid').value.trim();
+  let url = '/admin/memories/browse?limit=' + _memLimit + '&offset=' + _memOffset;
+  if (uid) url += '&user_id=' + encodeURIComponent(uid);
+  if (aid) url += '&agent_id=' + encodeURIComponent(aid);
+
+  wrap.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    const mems = data.memories || [];
+    const total = data.total || 0;
+    $('#mem-info').textContent = '共 ' + total + ' 条，当前 ' + (total > 0 ? _memOffset + 1 : 0) + '-' + Math.min(_memOffset + _memLimit, total);
+    $('#mem-pager').style.display = total > 0 ? 'flex' : 'none';
+    $('#btn-prev').disabled = _memOffset === 0;
+    $('#btn-next').disabled = _memOffset + _memLimit >= total;
+
+    if (mems.length === 0) {
+      wrap.innerHTML = '<div class="empty">无记忆</div>';
+      return;
+    }
+    let html = '';
+    for (const m of mems) {
+      const t = (m.updated_at || m.created_at || '');
+      const tStr = t ? new Date(t).toLocaleString('zh-CN', {dateStyle:'short',timeStyle:'short'}) : '';
+      html += '<div class="mem-item">' +
+        '<div class="mem-content">' + esc(m.memory) + '</div>' +
+        '<div class="mem-meta">' +
+          (m.user_id ? '<span class="badge badge-user">' + esc(m.user_id) + '</span>' : '') +
+          (m.agent_id ? '<span class="badge badge-agent">' + esc(m.agent_id) + '</span>' : '') +
+          '<span>' + tStr + '</span>' +
+          '<span class="mono">' + esc((m.id||'').substring(0,8)) + '</span>' +
+          '<button class="btn-del-mem" onclick="delMem(\'' + esc(m.id) + '\',this)">删除</button>' +
+        '</div>' +
+      '</div>';
+    }
+    wrap.innerHTML = html;
+  } catch(e) {
+    wrap.innerHTML = '<div class="empty">加载失败</div>';
+  }
+}
+
+async function delMem(id, btn) {
+  if (!confirm('确定删除此条记忆？')) return;
+  try {
+    const res = await fetch('/admin/memories/' + id, {method:'DELETE'});
+    if (res.ok) {
+      btn.closest('.mem-item').style.opacity = '0';
+      setTimeout(() => { btn.closest('.mem-item').remove(); }, 200);
+      toast('已删除');
+      loadUsers(); // refresh counts
+    } else {
+      toast('删除失败');
+    }
+  } catch(e) { toast('请求失败'); }
+}
 </script>
 </body>
 </html>
